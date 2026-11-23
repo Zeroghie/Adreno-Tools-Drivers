@@ -77,6 +77,8 @@ apply_unified_patches() {
                   a8xx/a8xx_lrz_color_mask.py a8xx/process_heap_usage.py; do
         python3 -B "$REPO_ROOT/patches/$script"
     done
+    python3 -B "$REPO_ROOT/patches/a7xx/ayn_thor_a740_stability.py"
+
 
     grep -Fq 'U_GRALLOC_TYPE_AIMAPPER' src/util/u_gralloc/u_gralloc.h
     grep -Fq 'name="Adreno (TM) 825"' src/freedreno/common/freedreno_devices.py
@@ -190,7 +192,7 @@ from pathlib import Path
 commit, header_version, min_api, output = sys.argv[1:]
 meta = {
     "schemaVersion": 1,
-    "name": "Turnip v27.0.0-R3",
+    "name": "Turnip v27.0.0-R3 AYN-Thor-A740",
     "description": f"Mesa {commit}",
     "author": "StevenMXZ",
     "packageVersion": "R2",
