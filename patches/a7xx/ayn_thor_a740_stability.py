@@ -198,20 +198,73 @@ def patch_device():
         print(f"  {DEVICE_CC}: heap cap already applied")
         return
 
-    heap_re = re.compile(r"(available_ram\s*=\s*)total_ram\s*\*\s*3\s*/\s*4\s*;")
-    if not heap_re.search(content):
-        print(f"  WARNING: {DEVICE_CC}: 'available_ram = total_ram * 3 / 4' not found "
-              f"(fork may already have changed it), skipping heap cap", file=sys.stderr)
+    # 1. Locate the definition of tu_get_system_heap_size and extract its body.
+    fn = re.search(r"\btu_get_system_heap_size\s*\([^;{]*\)\s*\{", content)
+    if not fn:
+        print(f"  WARNING: {DEVICE_CC}: definition of tu_get_system_heap_size not found, "
+              f"skipping heap cap", file=sys.stderr)
+        return
+
+    depth, i = 1, fn.end()
+    while i < len(content) and depth:
+        if content[i] == "{":
+            depth += 1
+        elif content[i] == "}":
+            depth -= 1
+        i += 1
+    if depth:
+        print(f"  WARNING: {DEVICE_CC}: unbalanced braces in tu_get_system_heap_size, "
+              f"skipping heap cap", file=sys.stderr)
+        return
+
+    body_start, body_end = fn.end(), i
+    body = content[body_start:body_end]
+    if "total_ram" not in body:
+        print(f"  WARNING: {DEVICE_CC}: no 'total_ram' inside tu_get_system_heap_size "
+              f"(Mesa changed it?), skipping heap cap", file=sys.stderr)
+        return
+
+    # 2. Flexible matcher for the "3/4 of total_ram" expression, in any common spelling:
+    #    total_ram * 3 / 4, (total_ram * 3) / 4, total_ram / 4 * 3,
+    #    total_ram - total_ram / 4, total_ram * 0.75, with optional casts / u,ull suffixes.
+    n = r"(?:[uU]?[lL]{0,2})"
+    tr = r"(?:\(\s*u?int64_t\s*\)\s*)?total_ram"
+    three_quarters = re.compile(
+        r"\(\s*" + tr + r"\s*\*\s*3" + n + r"\s*\)\s*/\s*4" + n +
+        r"|" + tr + r"\s*\*\s*3" + n + r"\s*/\s*4" + n +
+        r"|" + tr + r"\s*/\s*4" + n + r"\s*\*\s*3" + n +
+        r"|" + tr + r"\s*-\s*\(\s*" + tr + r"\s*/\s*4" + n + r"\s*\)" +
+        r"|" + tr + r"\s*-\s*" + tr + r"\s*/\s*4" + n +
+        r"|" + tr + r"\s*\*\s*0\.75f?"
+    )
+    repl = "(total_ram * 5) / 8 /* " + MARKER + ": heap 3/4 -> 5/8 */"
+
+    lines = body.split("\n")
+    replaced = 0
+    for idx, line in enumerate(lines):
+        if line.lstrip().startswith(("//", "/*", "*")):
+            continue  # never touch comment lines
+        code, sep, comment = line.partition("//")
+        new_code, cnt = three_quarters.subn(repl, code)
+        if cnt:
+            lines[idx] = new_code + sep + comment
+            replaced += cnt
+
+    if not replaced:
+        print(f"  WARNING: {DEVICE_CC}: no 3/4 expression on total_ram found in "
+              f"tu_get_system_heap_size, skipping heap cap. Lines using total_ram:",
+              file=sys.stderr)
+        for ln in body.split("\n"):
+            if "total_ram" in ln:
+                print(f"    {ln.strip()[:120]}", file=sys.stderr)
         return
 
     ext_before = sorted(EXT_RE.findall(content))
     bal_before = brace_balance(content)
 
-    new = heap_re.sub(
-        r"\g<1>total_ram * 5 / 8; /* AYN-A740-STABILITY: heap 3/4 -> 5/8, leave RAM for the emulator */",
-        content, count=1)
+    new = content[:body_start] + "\n".join(lines) + content[body_end:]
 
-    # Guarantees: no extension/feature token added or removed, braces unchanged.
+    # 3. Guarantees: no extension/feature token added or removed, braces unchanged.
     if sorted(EXT_RE.findall(new)) != ext_before:
         print(f"  FATAL: extension tokens changed in {DEVICE_CC}, not writing", file=sys.stderr)
         sys.exit(1)
@@ -220,7 +273,8 @@ def patch_device():
         sys.exit(1)
 
     write(DEVICE_CC, new)
-    print(f"  {DEVICE_CC}: system heap cap 3/4 -> 5/8 of RAM (extensions untouched: {len(ext_before)} tokens verified)")
+    print(f"  {DEVICE_CC}: tu_get_system_heap_size total_ram 3/4 -> 5/8 "
+          f"({replaced} expression(s); extensions untouched: {len(ext_before)} tokens verified)")
 
 
 patch_pipeline()
