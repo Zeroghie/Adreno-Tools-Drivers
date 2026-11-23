@@ -194,22 +194,29 @@ def patch_device():
         return
     audit(DEVICE_CC, content)
 
-    if f"{MARKER}: heap" in content:
-        print(f"  {DEVICE_CC}: heap cap already applied")
-        return
+    # Same-length copy with comments and string/char literals blanked out, so that
+    # regexes and brace counting never see them. Offsets match `content` exactly.
+    lit = re.compile(r"//[^\n]*|/\*.*?\*/|\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'", re.S)
+    masked = lit.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), content)
 
-    # 1. Locate the definition of tu_get_system_heap_size and extract its body.
-    fn = re.search(r"\btu_get_system_heap_size\s*\([^;{]*\)\s*\{", content)
+    # 1. Locate the definition (not a call) and extract its body by brace matching.
+    fn = None
+    for m in re.finditer(r"\btu_get_system_heap_size\s*\([^;{]*\)\s*\{", masked):
+        line_start = masked.rfind("\n", 0, m.start()) + 1
+        if re.search(r"[(=]|\breturn\b", masked[line_start:m.start()]):
+            continue  # call context, not a definition
+        fn = m
+        break
     if not fn:
         print(f"  WARNING: {DEVICE_CC}: definition of tu_get_system_heap_size not found, "
               f"skipping heap cap", file=sys.stderr)
         return
 
     depth, i = 1, fn.end()
-    while i < len(content) and depth:
-        if content[i] == "{":
+    while i < len(masked) and depth:
+        if masked[i] == "{":
             depth += 1
-        elif content[i] == "}":
+        elif masked[i] == "}":
             depth -= 1
         i += 1
     if depth:
@@ -217,64 +224,68 @@ def patch_device():
               f"skipping heap cap", file=sys.stderr)
         return
 
-    body_start, body_end = fn.end(), i
+    body_start, body_end = fn.end(), i          # body_end is just past the closing '}'
     body = content[body_start:body_end]
-    if "total_ram" not in body:
-        print(f"  WARNING: {DEVICE_CC}: no 'total_ram' inside tu_get_system_heap_size "
-              f"(Mesa changed it?), skipping heap cap", file=sys.stderr)
+    mbody = masked[body_start:body_end]
+
+    # 2. Always print the full function, with file line numbers.
+    first_line = content.count("\n", 0, fn.start()) + 1
+    func_text = content[fn.start():body_end]
+    print(f"  {DEVICE_CC}: tu_get_system_heap_size as found (from line {first_line}):", flush=True)
+    for k, ln in enumerate(func_text.split("\n")):
+        print(f"    {first_line + k:5d} | {ln}", flush=True)
+
+    # Idempotency (also covers the marker written by the earlier 5/8 version).
+    if f"{MARKER}: heap" in body:
+        print(f"  {DEVICE_CC}: heap cap already applied")
         return
 
-    # 2. Flexible matcher for the "3/4 of total_ram" expression, in any common spelling:
-    #    total_ram * 3 / 4, (total_ram * 3) / 4, total_ram / 4 * 3,
-    #    total_ram - total_ram / 4, total_ram * 0.75, with optional casts / u,ull suffixes.
-    n = r"(?:[uU]?[lL]{0,2})"
-    tr = r"(?:\(\s*u?int64_t\s*\)\s*)?total_ram"
-    three_quarters = re.compile(
-        r"\(\s*" + tr + r"\s*\*\s*3" + n + r"\s*\)\s*/\s*4" + n +
-        r"|" + tr + r"\s*\*\s*3" + n + r"\s*/\s*4" + n +
-        r"|" + tr + r"\s*/\s*4" + n + r"\s*\*\s*3" + n +
-        r"|" + tr + r"\s*-\s*\(\s*" + tr + r"\s*/\s*4" + n + r"\s*\)" +
-        r"|" + tr + r"\s*-\s*" + tr + r"\s*/\s*4" + n +
-        r"|" + tr + r"\s*\*\s*0\.75f?"
-    )
-    repl = "(total_ram * 5) / 8 /* " + MARKER + ": heap 3/4 -> 5/8 */"
-
-    lines = body.split("\n")
-    replaced = 0
-    for idx, line in enumerate(lines):
-        if line.lstrip().startswith(("//", "/*", "*")):
-            continue  # never touch comment lines
-        code, sep, comment = line.partition("//")
-        new_code, cnt = three_quarters.subn(repl, code)
-        if cnt:
-            lines[idx] = new_code + sep + comment
-            replaced += cnt
-
-    if not replaced:
-        print(f"  WARNING: {DEVICE_CC}: no 3/4 expression on total_ram found in "
-              f"tu_get_system_heap_size, skipping heap cap. Lines using total_ram:",
-              file=sys.stderr)
-        for ln in body.split("\n"):
-            if "total_ram" in ln:
-                print(f"    {ln.strip()[:120]}", file=sys.stderr)
+    # 3. Find the last `return <EXPR>;` and require it to be at function top level.
+    returns = list(re.finditer(r"\breturn\b(?P<e>[^;]*);", mbody))
+    if not returns:
+        print(f"  WARNING: {DEVICE_CC}: no 'return <expr>;' in tu_get_system_heap_size "
+              f"(value may be returned via an out-param), skipping heap cap", file=sys.stderr)
+        return
+    last = returns[-1]
+    expr = body[last.start("e"):last.end("e")].strip()
+    if not expr:
+        print(f"  WARNING: {DEVICE_CC}: last return in tu_get_system_heap_size has no "
+              f"expression, skipping heap cap", file=sys.stderr)
+        return
+    if "//" in expr:
+        print(f"  WARNING: {DEVICE_CC}: line comment inside the return expression, "
+              f"skipping heap cap to avoid breaking the parentheses", file=sys.stderr)
+        return
+    nest = mbody[:last.start()].count("{") - mbody[:last.start()].count("}")
+    if nest != 0:
+        print(f"  WARNING: {DEVICE_CC}: last return is inside a nested block (depth {nest}), "
+              f"there is no final top-level return; skipping heap cap", file=sys.stderr)
         return
 
     ext_before = sorted(EXT_RE.findall(content))
     bal_before = brace_balance(content)
 
-    new = content[:body_start] + "\n".join(lines) + content[body_end:]
+    new_ret = f"return ({expr}) * 5 / 6; /* {MARKER}: heap cap */"
+    new_body = body[:last.start()] + new_ret + body[last.end():]
+    new = content[:body_start] + new_body + content[body_end:]
 
-    # 3. Guarantees: no extension/feature token added or removed, braces unchanged.
+    # 4. Guarantees: no extension/feature token added or removed, braces unchanged.
     if sorted(EXT_RE.findall(new)) != ext_before:
         print(f"  FATAL: extension tokens changed in {DEVICE_CC}, not writing", file=sys.stderr)
         sys.exit(1)
     if brace_balance(new) != bal_before:
         print(f"  FATAL: brace balance changed in {DEVICE_CC}, not writing", file=sys.stderr)
         sys.exit(1)
+    if new.count(f"{MARKER}: heap cap") != 1:
+        print(f"  FATAL: heap cap marker count != 1 in {DEVICE_CC}, not writing", file=sys.stderr)
+        sys.exit(1)
 
     write(DEVICE_CC, new)
-    print(f"  {DEVICE_CC}: tu_get_system_heap_size total_ram 3/4 -> 5/8 "
-          f"({replaced} expression(s); extensions untouched: {len(ext_before)} tokens verified)")
+    one_line = " ".join(expr.split())
+    print(f"  {DEVICE_CC}: patched last return in tu_get_system_heap_size: "
+          f"'return {one_line};' -> 'return ({one_line}) * 5 / 6;' "
+          f"({len(returns) - 1} earlier return(s) untouched; "
+          f"extensions untouched: {len(ext_before)} tokens verified)")
 
 
 patch_pipeline()
