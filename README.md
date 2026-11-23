@@ -1,5 +1,3 @@
-<div align="center">
-
 # 🎮 Turnip V40 — AYN Thor Pro Edition (Adreno 740)
 
 [![Device](https://shields.io)](https://github.com)
@@ -7,11 +5,10 @@
 [![GPU](https://shields.io)](https://github.com)
 [![Vulkan](https://shields.io)](https://github.com)
 
-**Custom Mesa 27.0.0-devel (Turnip v27.0.0-R3 / V40 base) driver compiled via NDK r29 & KGSL, specifically tuned for stability and memory management on 12 GB RAM devices.**
+> **Custom Mesa 27.0.0-devel (Turnip v27.0.0-R3 / V40 base) driver compiled via NDK r29 & KGSL, specifically tuned for stability and memory management on 12 GB RAM devices.**
 
-[⬇️ **Download Latest Release**](https://github.com)
+### 👉 [**⬇️ DOWNLOAD LATEST RELEASE (ZIP)**](https://github.com)
 
-</div>
 
 ---
 
