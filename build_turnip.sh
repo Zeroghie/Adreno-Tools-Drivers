@@ -11,7 +11,7 @@ INSTALL_DIR="$WORKDIR/install"
 NDKVER="android-ndk-r29"
 NDK="$WORKDIR/$NDKVER/toolchains/llvm/prebuilt/linux-x86_64/bin"
 MIN_API=28
-MESA_COMMIT="${MESA_COMMIT:-}"
+MESA_COMMIT="${MESA_COMMIT:-c5ef4bdfabf2e1a76d5e41ab8e5d75ddbc121275}"
 
 log() { echo -e "${green}$*${nocolor}"; }
 die() { echo -e "${red}$*${nocolor}" >&2; exit 1; }
