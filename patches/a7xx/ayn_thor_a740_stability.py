@@ -1,112 +1,89 @@
-#!/usr/bin/env python3
-import os
 import re
-import sys
+from mesa_edit import replace
 
-def read_file(path):
-    if not os.path.exists(path):
-        print(f"[WARN] File non trovato: {path}")
-        return None
-    with open(path, "r", encoding="utf-8", errors="ignore") as f:
-        return f.read()
+DEVICE = 'src/freedreno/vulkan/tu_device.cc'
+IMAGE = 'src/freedreno/vulkan/tu_image.cc'
+PIPELINE = 'src/freedreno/vulkan/tu_pipeline.cc'
 
-def write_file(path, content):
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(content)
+# 1. Aggancia process_heap_usage.py di StevenMXZ e limita heapBudget a 6 GiB su 12GB RAM
+replace(
+    DEVICE,
+    'memory_budget_props->heapUsage = p_atomic_read(&tu_process_heap_used);',
+    'memory_budget_props->heapUsage = p_atomic_read(&tu_process_heap_used);\n'
+    '   if (memory_budget_props->heapBudget > 6ULL * 1024 * 1024 * 1024)\n'
+    '      memory_budget_props->heapBudget = 6ULL * 1024 * 1024 * 1024;',
+    'AYN Thor Pro: cap heapBudget to 6 GiB to prevent 12GB OOM',
+)
 
-def patch_tu_device():
-    path = "src/freedreno/vulkan/tu_device.cc"
-    content = read_file(path)
-    if not content:
-        return
+# 2. Disattiva UBWC sulle immagini MUTABLE (non-A8xx) e STORAGE in tu_image.cc (fix quadratini A740 senza noubwc)
+replace(
+    IMAGE,
+    '   if ((pCreateInfo->flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) &&\n'
+    '       !vk_format_is_depth_or_stencil(image->vk.format)) {',
+    '   if (pCreateInfo->usage & VK_IMAGE_USAGE_STORAGE_BIT)\n'
+    '      ubwc_enabled = false;\n'
+    '   if ((pCreateInfo->flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) &&\n'
+    '       !vk_format_is_depth_or_stencil(image->vk.format)) {\n'
+    '      if (!mutable_ubwc_fc)\n'
+    '         ubwc_enabled = false;',
+    'AYN Thor Pro: disable UBWC on non-A8xx mutable/storage images to fix A740 block artifacts',
+)
 
-    modified = False
+# 3. Riduce i blocchi del sub-allocatore BO a 32MB in tu_device.cc
+with open(DEVICE, 'r', encoding='utf-8') as f:
+    dev_src = f.read()
 
-    # 1. Riduce la dimensione dei blocchi del sub-allocatore BO per evitare accumuli di RAM su Android 12GB
-    suballoc_pattern = re.compile(r'(tu_bo_suballoc_init\s*\([^;]+?,\s*)(128|64)(\s*\*\s*1024\s*\*\s*1024)')
-    if suballoc_pattern.search(content):
-        content = suballoc_pattern.sub(r'\g<1>32\g<3>', content)
-        print("[OK] Sub-allocatore BO ridotto a 32MB in tu_device.cc")
-        modified = True
-    else:
-        print("[INFO] Pattern sub-allocatore non trovato o già modificato in tu_device.cc")
+new_dev_src, count = re.subn(
+    r'(tu_bo_suballoc_init\s*\([^;]+?,\s*)(128|64)(\s*\*\s*1024\s*\*\s*1024)',
+    r'\g<1>32\g<3>',
+    dev_src,
+)
+if count > 0:
+    with open(DEVICE, 'w', encoding='utf-8') as f:
+        f.write(new_dev_src)
+    print(f'{DEVICE}: AYN Thor Pro suballoc block size reduced to 32MB')
 
-    # 2. Tetto massimo a 6 GB (6144 MB) per heapBudget / memoryHeaps così l'emulatore svuota prima la cache
-    budget_hook = """
-   /* AYN Thor Pro 12GB OOM Prevention: cap reported VRAM budget to 6GB */
-   const uint64_t ayn_max_vram = 6ULL * 1024 * 1024 * 1024;
-   for (uint32_t i = 0; i < pMemoryProperties->memoryProperties.memoryHeapCount; i++) {
-      if (pMemoryProperties->memoryProperties.memoryHeaps[i].size > ayn_max_vram) {
-         pMemoryProperties->memoryProperties.memoryHeaps[i].size = ayn_max_vram;
-      }
+# 4. Limitatore automatico thread shader leggendo /proc/meminfo (se MemAvailable < 3.5 GiB -> max 2 thread)
+with open(PIPELINE, 'r', encoding='utf-8') as f:
+    pip_src = f.read()
+
+meminfo_helper = """
+#include <stdio.h>
+#include <string.h>
+static uint32_t ayn_thor_clamp_compiler_threads(uint32_t requested) {
+   FILE *fp = fopen("/proc/meminfo", "r");
+   if (!fp) return requested > 2 ? 2 : requested;
+   char line[128];
+   unsigned long avail_kb = 0;
+   while (fgets(line, sizeof(line), fp)) {
+      if (sscanf(line, "MemAvailable: %lu kB", &avail_kb) == 1)
+         break;
    }
+   fclose(fp);
+   if (avail_kb > 0 && avail_kb < 3670016UL) /* < 3.5 GiB liberi */
+      return requested > 2 ? 2 : requested;
+   return requested > 4 ? 4 : requested;
+}
 """
-    # Inserimento sicuro dentro tu_GetPhysicalDeviceMemoryProperties2 prima del return finale
-    mem_props_pattern = re.compile(
-        r'(VKAPI_ATTR\s+void\s+VKAPI_CALL\s+tu_GetPhysicalDeviceMemoryProperties2\s*\([^)]+\)\s*\{.*?)(\n\})',
-        re.DOTALL
+
+if 'ayn_thor_clamp_compiler_threads' not in pip_src:
+    # Inserisce l'helper subito prima della prima funzione void/VkResult in tu_pipeline.cc
+    pip_mod, h_cnt = re.subn(
+        r'(\n(?:static\s+)?(?:void|VkResult)\s+tu_)',
+        '\n' + meminfo_helper + r'\1',
+        pip_src,
+        count=1,
     )
-    if "ayn_max_vram" not in content and mem_props_pattern.search(content):
-        budget_ext_hook = """
-   vk_foreach_struct(ext, pMemoryProperties->pNext) {
-      if (ext->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT) {
-         VkPhysicalDeviceMemoryBudgetPropertiesEXT *budget =
-            (VkPhysicalDeviceMemoryBudgetPropertiesEXT *)ext;
-         for (uint32_t i = 0; i < VK_MAX_MEMORY_HEAPS; i++) {
-            if (budget->heapBudget[i] > ayn_max_vram)
-               budget->heapBudget[i] = ayn_max_vram;
-         }
-      }
-   }
-"""
-        content = mem_props_pattern.sub(r'\1' + budget_hook + budget_ext_hook + r'\2', content, count=1)
-        print("[OK] Tetto Memory Budget 6GB applicato in tu_device.cc")
-        modified = True
-    else:
-        print("[INFO] Hook Memory Budget non inserito o già presente in tu_device.cc")
-
-    if modified:
-        write_file(path, content)
-
-def patch_tu_image():
-    path = "src/freedreno/vulkan/tu_image.cc"
-    content = read_file(path)
-    if not content:
-        return
-
-    if "ayn_ubwc_selective" in content:
-        print("[INFO] Patch UBWC selettiva già presente in tu_image.cc")
-        return
-
-    # 3. Disattiva UBWC SOLO su immagini STORAGE o MUTABLE_FORMAT (causa dei quadratini su Adreno 740)
-    ubwc_pattern = re.compile(
-        r'(tu6_ubwc_possible\s*\([^)]*\)\s*\{)',
-        re.DOTALL
+    # Aggancia util_queue_init se presente per limitare num_threads
+    pip_mod, q_cnt = re.subn(
+        r'(util_queue_init\s*\([^,]+,\s*[^,]+,\s*[^,]+,\s*)([^,]+)(,\s*[^)]+\))',
+        r'\1ayn_thor_clamp_compiler_threads(\2)\3',
+        pip_mod,
     )
-
-    ubwc_guard = """
-   /* ayn_ubwc_selective: disable UBWC only on storage/mutable images to prevent A740 block artifacts */
-   if (info->usage & VK_IMAGE_USAGE_STORAGE_BIT)
-      return false;
-   if (info->flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT)
-      return false;
-"""
-
-    if ubwc_pattern.search(content):
-        # Verifica che il parametro si chiami 'info' prima di inserire
-        func_header = ubwc_pattern.search(content).group(1)
-        if "VkImageCreateInfo" in func_header and "*info" in func_header:
-            content = ubwc_pattern.sub(r'\1' + ubwc_guard, content, count=1)
-            write_file(path, content)
-            print("[OK] Patch UBWC selettiva (STORAGE/MUTABLE) applicata in tu_image.cc")
-        else:
-            print("[WARN] Firma di tu6_ubwc_possible diversa dal previsto, salto per sicurezza")
+    if h_cnt > 0 and q_cnt > 0:
+        with open(PIPELINE, 'w', encoding='utf-8') as f:
+            f.write(pip_mod)
+        print(f'{PIPELINE}: AYN Thor Pro /proc/meminfo dynamic shader thread limiter applied')
     else:
-        print("[INFO] Funzione tu6_ubwc_possible non trovata in tu_image.cc")
+        print(f'{PIPELINE}: util_queue_init pattern not matched, skipping dynamic thread clamp safely')
 
-if __name__ == "__main__":
-    print("=== Applicazione patch AYN Thor Pro (Adreno 740 / 12GB RAM) per Turnip V40 ===")
-    patch_tu_device()
-    patch_tu_image()
-    print("=== Completato ===")
-  
