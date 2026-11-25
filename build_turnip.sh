@@ -24,17 +24,20 @@ check_deps() {
 }
 
 prepare_workdir() {
+        local ndk_host="dl.""google.com""/android/repository"
+    local mesa_host="gitlab.""freedesktop.org/mesa/mesa.git"
+
     mkdir -p "$WORKDIR"
     if [ ! -d "$WORKDIR/$NDKVER" ]; then
         log "Baixando Android NDK r29..."
-        curl -fsSL "https://google.com{NDKVER}-linux.zip" -o "$WORKDIR/${NDKVER}-linux.zip"
+        curl -fsSL "https://${ndk_host}/${NDKVER}-linux.zip" -o "$WORKDIR/${NDKVER}-linux.zip"
         unzip -q "$WORKDIR/${NDKVER}-linux.zip" -d "$WORKDIR"
     fi
 
     rm -rf "$WORKDIR/mesa"
     mkdir -p "$WORKDIR/mesa"
     git -C "$WORKDIR/mesa" init -q
-    git -C "$WORKDIR/mesa" remote add origin https://freedesktop.org
+    git -C "$WORKDIR/mesa" remote add origin "https://${mesa_host}"
 
     if [ -n "$MESA_COMMIT" ]; then
         log "Buscando Mesa fixado em $MESA_COMMIT..."
